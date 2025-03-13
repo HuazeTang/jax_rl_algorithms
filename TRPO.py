@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from jax import config as jax_config
 
 import flax.linen as nn
 from flax.training.train_state import TrainState
@@ -90,7 +91,7 @@ def update_minibatch(
     trpo_loss = TRPOLoss(
         network=network,
         config=LossConfig(
-            vf_coef=config.VF_COEF, ent_coef=config.ENT_COEF
+            clip_eps=config.CLIP_EPS, vf_coef=config.VF_COEF, ent_coef=config.ENT_COEF
         )
     )
 
@@ -102,7 +103,6 @@ def update_minibatch(
     )
 
     print(grads)
-    exit()
 
     train_state = train_state.apply_gradients(grads=grads)
 
@@ -295,7 +295,7 @@ def make_train(config: AlgoConfig) -> Callable:
     return train
 
 if __name__ == "__main__":
-    config = AlgoConfig(
+    algo_config = AlgoConfig(
         NUM_ENVS=2048, 
         NUM_STEPS=40, 
         TOTAL_TIMESTEPS=1e8, 
@@ -303,7 +303,7 @@ if __name__ == "__main__":
         NUM_MINIBATCHES=128, 
         GAMMA=0.99, 
         GAE_LAMBDA=0.95, 
-        CLIP_EPS=0.2, 
+        CLIP_EPS=1e5, 
         ENT_COEF=0.0, 
         VF_COEF=0.5, 
         LR=3e-4, 
@@ -318,13 +318,15 @@ if __name__ == "__main__":
     )
 
     value_calculator = GAECalculator(
-        GAEConfig(gamma=config.GAMMA, gae_lambda=config.GAE_LAMBDA)
+        GAEConfig(gamma=algo_config.GAMMA, gae_lambda=algo_config.GAE_LAMBDA)
     )
 
     # jax.config.update("jax_debug_nans", True)
 
+    jax_config.update("jax_debug_nans", True)
+
     rng = jax.random.PRNGKey(20)
-    # train_jit = jax.jit(make_train(config), device=jax.devices('gpu')[0])
+    # train_jit = jax.jit(make_train(algo_config), device=jax.devices('gpu')[0])
     # out = train_jit(rng)
-    train = make_train(config)
+    train = make_train(algo_config)
     out = train(rng)

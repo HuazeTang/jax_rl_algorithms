@@ -1,1 +1,5 @@
 /logs
+/job
+install_jax_cu11.sh
+__pycache__
+*.out

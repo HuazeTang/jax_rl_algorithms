@@ -9,11 +9,12 @@ from utils.util_funcs import (
     tree_dot, 
     tree_squared_sum, 
     calculate_kl_divergence_with_clip, 
-    print_grad_info
+    print_jax_info
 )
 
 @dataclass
 class LossConfig:
+    clip_eps: float
     delta: float = 0.01  # KL divergence
     cg_iters: int = 10   # 共轭梯度法迭代次数
     backtrack_iters: int = 15 # 回溯线搜索迭代次数
@@ -35,7 +36,7 @@ class TRPOLoss:
         targets: jax.Array
     ) -> Tuple[jax.Array, Dict[str, jax.Array]]:
         """Calculate basic loss and necessary metrics (e.g. KL divergence, entropy, etc.)"""
-        # forward update network
+        # forward update networkclip_eps: float
         pi_new: distrax.MultivariateNormalDiag
         value: jax.Array
         pi_new, value = self.network.apply(params, batch.obs)
@@ -45,9 +46,13 @@ class TRPOLoss:
         value_loss = 0.5 * jnp.square(value - targets).mean()
         
         # policy grandient loss
-        ratio = jnp.exp(log_prob_new - batch.log_prob)
+        log_prob_diff = log_prob_new - batch.log_prob
+        log_prob_diff = jnp.clip(log_prob_diff, -1e8, 1e8)
+        ratio = jnp.exp(log_prob_diff)
+        # print_jax_info({"ratio": ratio}, "ratio")
         gae = (gae - gae.mean()) / (gae.std() + 1e-8)
-        loss_actor = -(ratio * gae).mean()
+        loss_actor = -(jnp.clip(ratio, 1-self.config.clip_eps, 1+self.config.clip_eps) * gae).mean()
+        # print_jax_info(loss_actor, "loss actor")
         
         # entropy regularization
         entropy = pi_new.entropy().mean()
@@ -57,15 +62,18 @@ class TRPOLoss:
             log_prob_old=batch.log_prob,
             log_prob_new=log_prob_new
         )
+        # print_jax_info(kl_divergence, "kl divergence")
         
         # total loss
         # Note: optimization object of TRPO requires constraint; here it is only used for gradient calculation
         total_loss = (
-            loss_actor 
+            # loss_actor 
             + self.config.vf_coef * value_loss 
-            - self.config.ent_coef * entropy
+            # - self.config.ent_coef * entropy
         )
         
+        # print_jax_info(total_loss, "total loss")
+
         stats = {
             'loss/total': total_loss,
             'loss/actor': loss_actor,
@@ -149,7 +157,7 @@ class TRPOLoss:
         full_step: dict, 
         batch: Transition
     ) -> float:
-        """JAX 兼容的回溯线搜索"""
+        """Line search to find proper step size"""
         def line_search_loss(alpha):
             new_params = jax.tree_map(
                 lambda p, s: p + alpha * s, 
@@ -165,20 +173,20 @@ class TRPOLoss:
             )
             return kl
         
-        # 生成候选 alpha 向量 [1.0, c, c^2, ..., c^k]
+        # Generate a list of candidate alpha values
         backtrack_iters = self.config.backtrack_iters
         coeffs = jnp.ones(backtrack_iters + 1) * self.config.backtrack_coeff
-        alphas = 1.0 * jnp.cumprod(coeffs)  # 向量化生成所有候选值
+        alphas = 1.0 * jnp.cumprod(coeffs)  # Vectorize generation of all candidate values
         
-        # 并行计算所有候选 alpha 的 KL 散度
+        # Get KL divergence of all candidate values in parallel
         kl_values = jax.vmap(line_search_loss)(alphas)
         
-        # 寻找第一个满足 KL <= delta * 1.5 的 alpha
-        delta_threshold = self.config.delta * 1.5
+        # Get the first valid alpha satisfying KL <= delta
+        delta_threshold = self.config.delta
         valid_mask = (kl_values <= delta_threshold).astype(jnp.float32)
         
-        # 若没有满足条件的 alpha，选择最后一个（最小步长）
-        idx = jnp.argmax(valid_mask)  # 第一个满足条件的索引
+        # If there is no valid alpha, return the last one
+        idx = jnp.argmax(valid_mask)  # The first index of the last valid alpha
         idx = jnp.where(valid_mask.sum() > 0, idx, backtrack_iters)
         
         return alphas[idx]
@@ -191,41 +199,45 @@ class TRPOLoss:
         targets: jax.Array,
     ) -> Tuple[dict, dict]:
         """Parameters update with TRPO"""
-        # 1. 计算损失和梯度
+        # print_jax_info(advantages, "Advantages")
+
+        # 1. get total loss and gradient
         grad_fn = jax.value_and_grad(self.compute_loss, has_aux=True)
 
         total_loss, grads = grad_fn(
             params, batch, advantages, targets
         )
 
-        print_grad_info(grads, "Direct gradient")
+        # print_jax_info(total_loss, "Loss")
+        # print_jax_info(grads, "Direct gradient")
         
-        # 2. 用共轭梯度法求解自然梯度方向: F^{-1} * grad
+        # 2. solve natural gradient direction F^{-1} * grad with conjugate gradient
         natural_grad = self.conjugate_gradient(params, batch, grads)
 
-        print_grad_info(natural_grad, "Natural gradient")
+        # print_jax_info(natural_grad, "Natural gradient")
         
-        # 3. 计算未约束的步长方向
+        # 3. get step direction without constraint
         step_direction = natural_grad
         
-        # 4. 计算最大步长 beta，使得 beta^2 * (step_dir^T F step_dir) <= delta
-        # calculate: (step_dir^T F step_dir)
+        # 4. get the maximal step length beta to make beta^2 * (step_dir^T F step_dir) <= delta
+        # 4.1 calculate: (step_dir^T F step_dir)
         fvp_step = self.fisher_vector_product(params, batch, step_direction)
         shs = jax.tree_util.tree_reduce(
             lambda s, x: s + jnp.sum(x), 
             jax.tree_map(lambda s_leaf, f_leaf: s_leaf * f_leaf, step_direction, fvp_step), 
             0.0
         )
+        # 4.2 calculate beta
         beta = jnp.sqrt(self.config.delta / (shs + 1e-8))
         full_step = jax.tree_map(lambda s: beta * s, step_direction)
         
         # 5. back linear search for optimal alpha (step size)
         alpha = self.backtracking_line_search(params, full_step, batch)
         
-        # 6. Assemble final gradient
+        # 6. assemble final gradient
         final_gradient = jax.tree_map(lambda x: alpha * x, full_step)
 
-        print_grad_info(final_gradient, f"Final gradient with alpha {alpha}")
+        # print_jax_info(final_gradient, f"Final gradient with alpha {alpha}")
         
         return total_loss, final_gradient
     
