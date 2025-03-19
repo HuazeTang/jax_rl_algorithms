@@ -26,7 +26,7 @@ def calculate_kl_divergence_with_clip(log_prob_old: jax.Array, log_prob_new: jax
 
     return kl_divergence
 
-def print_jax_info(array_dict, info: str):
+def print_jax_info(array_dict, info: str=""):
     """Print jax array/dict in a pretty way"""
     print("\n" + "=" * 40 + f" Jax array/dict: {info} " + "=" * 40)
 

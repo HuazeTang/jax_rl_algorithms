@@ -102,8 +102,6 @@ def update_minibatch(
         targets=targets,
     )
 
-    print(grads)
-
     train_state = train_state.apply_gradients(grads=grads)
 
     return train_state, total_loss
@@ -322,8 +320,7 @@ if __name__ == "__main__":
     )
 
     # jax.config.update("jax_debug_nans", True)
-
-    jax_config.update("jax_debug_nans", True)
+    # jax.config.update("jax_debug_infs", True)
 
     rng = jax.random.PRNGKey(20)
     # train_jit = jax.jit(make_train(algo_config), device=jax.devices('gpu')[0])
