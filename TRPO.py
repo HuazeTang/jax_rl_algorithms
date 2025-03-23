@@ -101,7 +101,6 @@ def update_minibatch(
         batch=traj_batch,
         advantages=advantages,
         targets=targets,
-        learning_rate=config.LR
     )
 
     jax.debug.callback(lambda x: print_jax_info(x, "params: before"), train_state.params)

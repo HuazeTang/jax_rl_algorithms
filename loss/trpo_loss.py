@@ -18,7 +18,7 @@ from utils.debug_tools import check_nan_inf_decorator
 class LossConfig:
     clip_eps: float
     delta: float = 0.001  # KL divergence
-    cg_iters: int = 100    # 共轭梯度法迭代次数
+    cg_iters: int = 100   # 共轭梯度法迭代次数
     backtrack_iters: int = 100 # 回溯线搜索迭代次数
     backtrack_coeff: float = 1./100. # 步长衰减系数
     vf_coef: float = 0.5  # 值函数损失系数
@@ -106,33 +106,29 @@ class TRPOLoss:
         Returns:
             fvp: The Fisher-vector product \(F * v\) (a PyTree).
         """
-        # Define the KL divergence function
-        def kl_divergence(params):
-            """
-            Compute the KL divergence between the old and new policy distributions.
-
-            Args:
-                params: Model parameters (a PyTree).
-
-            Returns:
-                kl: The KL divergence (a scalar).
-            """
-            # Apply the policy network to get the new action distribution
-            pi: distrax.MultivariateNormalDiag
-            pi, _ = self.network.apply(params, jax.lax.stop_gradient(batch.obs))
-
-            # Compute the log probability of actions under the new policy
-            log_prob = pi.log_prob(jax.lax.stop_gradient(batch.action))
-
-            # Calculate the KL divergence with clipping (for numerical stability)
-            return calculate_kl_divergence_with_clip(
-                log_prob_old=jax.lax.stop_gradient(batch.log_prob),
-                log_prob_new=log_prob
-            )
         
-        # Compute the Fisher-vector product \(F * v\) as the gradient of the dot product
-        # This is equivalent to the Hessian-vector product of the KL divergence
-        _, fvp = jax.jvp(jax.grad(kl_divergence), (params,), (vector,))
+        # Compute the log probability of actions under the new policy
+        def per_sample_log_prob(params, obs, action):
+            pi: distrax.MultivariateNormalDiag
+            pi, _ = self.network.apply(params, obs)
+            return pi.log_prob(action)
+        
+        # Compute the gradient of the log probability with respect to the parameters
+        batch_grad = jax.vmap(
+            jax.grad(per_sample_log_prob), 
+            in_axes=(None, 0, 0)  # not include params in in_axes
+        )(params, batch.obs, batch.action)
+
+        # Compute the Fisher-vector product (F * v) as the gradient of the dot product
+        def compute_contribution(sample_grad):
+            # calculate \nabla log_p^T v
+            dot_product = tree_dot(sample_grad, vector)
+            # mutliple \nabla log_p^T v with the gradient \nabla log_p^T
+            return jax.tree_map(lambda g: dot_product * g, sample_grad)
+
+        # Compute the mean of the Fisher-vector products over the batch
+        contributions = jax.vmap(compute_contribution)(batch_grad)
+        fvp = jax.tree_map(lambda x: jnp.mean(x, axis=0), contributions)
         
         # Prevent gradient propagation
         fvp = jax.lax.stop_gradient(fvp)
@@ -188,24 +184,19 @@ class TRPOLoss:
             new_r = jax.tree_map(lambda r_, fvp_: r_ - alpha * fvp_, r, fvp)
             # Compute new residual squared norm: r^T r
             new_rdotr = tree_squared_sum(new_r)
-            # Compute \beta = \frac{r_{\text{new}}^T r_{\text{new}}}{r^T r} with Polak-Ribière formula
-            delta_r = jax.tree_map(lambda new_r_, r_: new_r_ - r_, new_r, r)
-            beta = tree_dot(new_r, delta_r) / (rdotr + 1e-8) # Small constant for numerical stability
+            # Compute \beta = \frac{r_{\text{new}}^T r_{\text{new}}}{r^T r} 
+            # delta_r = jax.tree_map(lambda new_r_, r_: new_r_ - r_, new_r, r) # with Polak-Ribière formula
+            beta = new_rdotr / (rdotr + 1e-8) # Small constant for numerical stability
             # Update search direction: p = r + \beta * p
             new_p = jax.tree_map(lambda r_, p_: r_ + beta * p_, new_r, p)
-            new_p = jax.lax.cond(
-                (iteration % 10) == 0,
-                lambda: new_r,
-                lambda: new_p
-            )
 
-            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"shs_in_loop_itera{iteration}"), shs)
-            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"alpha_in_loop_itera{iteration}"), alpha)
-            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_x_in_loop_itera{iteration}"), new_x)
-            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_r_in_loop_itera{iteration}"), new_r)
-            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_rdotr_in_loop_itera{iteration}"), new_rdotr)
-            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"beta_in_loop_itera{iteration}"), beta)
-            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_p_in_loop_itera{iteration}"), new_p)
+            # jax.debug.callback(lambda input_info: print_jax_info(input_info, f"shs_in_loop_itera{iteration}"), shs)
+            # jax.debug.callback(lambda input_info: print_jax_info(input_info, f"alpha_in_loop_itera{iteration}"), alpha)
+            # jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_x_in_loop_itera{iteration}"), new_x)
+            # jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_r_in_loop_itera{iteration}"), new_r)
+            # jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_rdotr_in_loop_itera{iteration}"), new_rdotr)
+            # jax.debug.callback(lambda input_info: print_jax_info(input_info, f"beta_in_loop_itera{iteration}"), beta)
+            # jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_p_in_loop_itera{iteration}"), new_p)
 
             return new_x, new_r, new_p, new_rdotr, iteration+1
         
@@ -279,14 +270,13 @@ class TRPOLoss:
         
         return alphas[idx]
     
-    @check_nan_inf_decorator
+    # @check_nan_inf_decorator
     def update_step(
         self,
         params: dict,
         batch: Transition,
         advantages: jax.Array,
         targets: jax.Array,
-        learning_rate: float
     ) -> Tuple[dict, dict]:
         """Parameters update with TRPO"""
 
