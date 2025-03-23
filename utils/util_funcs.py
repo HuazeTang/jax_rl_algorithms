@@ -20,8 +20,8 @@ def tree_squared_sum(tree):
     )
 
 def calculate_kl_divergence_with_clip(log_prob_old: jax.Array, log_prob_new: jax.Array):
-    log_prob_new_clip = jnp.clip(log_prob_new, a_min=-1e8, a_max=0)
-    log_prob_old_clip = jnp.clip(log_prob_old, a_min=-1e8, a_max=0)
+    log_prob_new_clip = jnp.clip(log_prob_new, a_min=-1e8, a_max=1e8)
+    log_prob_old_clip = jnp.clip(log_prob_old, a_min=-1e8, a_max=1e8)
     kl_divergence = jnp.mean(log_prob_old_clip - log_prob_new_clip)
 
     return kl_divergence

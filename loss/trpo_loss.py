@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+import operator
 from dataclasses import dataclass
 import distrax
 import flax.linen as nn
@@ -16,10 +17,10 @@ from utils.debug_tools import check_nan_inf_decorator
 @dataclass
 class LossConfig:
     clip_eps: float
-    delta: float = 0.01  # KL divergence
-    cg_iters: int = 10   # 共轭梯度法迭代次数
-    backtrack_iters: int = 15 # 回溯线搜索迭代次数
-    backtrack_coeff: float = 1. # 步长衰减系数
+    delta: float = 0.001  # KL divergence
+    cg_iters: int = 100    # 共轭梯度法迭代次数
+    backtrack_iters: int = 100 # 回溯线搜索迭代次数
+    backtrack_coeff: float = 1./100. # 步长衰减系数
     vf_coef: float = 0.5  # 值函数损失系数
     ent_coef: float = 0.0 # 熵正则化系数
 
@@ -83,8 +84,8 @@ class TRPOLoss:
             'stats/ratio': ratio.mean(),
         }
         return total_loss, stats
-
-    @check_nan_inf_decorator
+    
+    # @check_nan_inf_decorator
     def fisher_vector_product(
         self, 
         params: dict, 
@@ -129,31 +130,16 @@ class TRPOLoss:
                 log_prob_new=log_prob
             )
         
-        def compute_fvp(params, vector):
-            """Compute the Fisher-vector product \(F * v\)."""
-            # Calculate gradient
-            grad_kl = jax.grad(kl_divergence)(params)
-            # jax.debug.callback(lambda x: print_jax_info(x, "kl gradient"), grad_kl)
-            
-            # Compute the dot product between the gradient of KL and the input vector \(v\)
-            vector = jax.lax.stop_gradient(vector)
-            dot_product = jax.tree_util.tree_reduce(
-                lambda a, b: a + b,
-                jax.tree_map(lambda g, v: jnp.sum(g * v), grad_kl, vector)
-            )
-
-            return dot_product
-        
         # Compute the Fisher-vector product \(F * v\) as the gradient of the dot product
         # This is equivalent to the Hessian-vector product of the KL divergence
-        fvp = jax.grad(compute_fvp)(params, vector)
+        _, fvp = jax.jvp(jax.grad(kl_divergence), (params,), (vector,))
         
         # Prevent gradient propagation
         fvp = jax.lax.stop_gradient(fvp)
 
         return fvp
 
-    @check_nan_inf_decorator
+    # @check_nan_inf_decorator
     def conjugate_gradient(
         self, 
         params: dict, 
@@ -186,32 +172,49 @@ class TRPOLoss:
             Returns:
                 Updated values of x, r, p, and rdotr.
             """
-            x, r, p, rdotr = val
+            x, r, p, rdotr, iteration = val
 
             # Compute the Fisher vector product (fvp = F * p) using the Fisher matrix.
-            fvp = self.fisher_vector_product(params, batch, p)
-            # jax.debug.callback(lambda q: print_jax_info(q, "fvp"), fvp)
+            raw_fvp = self.fisher_vector_product(params, batch, p)
+            # add a very small Tikhonov regularization term to the fvp to avoid the matrix being singular
+            fvp = jax.tree_map(lambda fvp_, p_: fvp_ + 1e-4 * p_, raw_fvp, p)
             # Compute the scalar product of the residual (shs = p^T * F * p) with the fvp.
             shs = tree_dot(p, fvp)
             # Compute step size \alpha = \frac{r^T r}{p^T F p}
             alpha = rdotr / (shs + 1e-8) # Small constant for numerical stability
             # Update solution: x = x + \alpha * p
-            x = jax.tree_map(lambda x_, p_, a=alpha: x_ + a * p_, x, p)
+            new_x = jax.tree_map(lambda x_, p_: x_ + alpha * p_, x, p)
             # Update residual: r = r - \alpha * F * p
-            r = jax.tree_map(lambda r_, fvp_, a=alpha: r_ - a * fvp_, r, fvp)
+            new_r = jax.tree_map(lambda r_, fvp_: r_ - alpha * fvp_, r, fvp)
             # Compute new residual squared norm: r^T r
-            new_rdotr = tree_squared_sum(r)
-            # Compute \beta = \frac{r_{\text{new}}^T r_{\text{new}}}{r^T r}
-            beta = new_rdotr / (rdotr + 1e-8) # Small constant for numerical stability
+            new_rdotr = tree_squared_sum(new_r)
+            # Compute \beta = \frac{r_{\text{new}}^T r_{\text{new}}}{r^T r} with Polak-Ribière formula
+            delta_r = jax.tree_map(lambda new_r_, r_: new_r_ - r_, new_r, r)
+            beta = tree_dot(new_r, delta_r) / (rdotr + 1e-8) # Small constant for numerical stability
             # Update search direction: p = r + \beta * p
-            p = jax.tree_map(lambda r_, p_, b=beta: r_ + b * p_, r, p)
-            return x, r, p, new_rdotr
+            new_p = jax.tree_map(lambda r_, p_: r_ + beta * p_, new_r, p)
+            new_p = jax.lax.cond(
+                (iteration % 10) == 0,
+                lambda: new_r,
+                lambda: new_p
+            )
+
+            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"shs_in_loop_itera{iteration}"), shs)
+            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"alpha_in_loop_itera{iteration}"), alpha)
+            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_x_in_loop_itera{iteration}"), new_x)
+            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_r_in_loop_itera{iteration}"), new_r)
+            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_rdotr_in_loop_itera{iteration}"), new_rdotr)
+            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"beta_in_loop_itera{iteration}"), beta)
+            jax.debug.callback(lambda input_info: print_jax_info(input_info, f"new_p_in_loop_itera{iteration}"), new_p)
+
+            return new_x, new_r, new_p, new_rdotr, iteration+1
         
         # init values
         x = jax.tree_map(jnp.zeros_like, b) # x: Initial solution estimate (zeros)
         r = jax.tree_map(jnp.copy, b)       # r: Initial residual (r = b - F * x, but x=0 so r = b)
         p = jax.tree_map(jnp.copy, r)       # p: Initial search direction (p = r)
         rdotr_init = tree_squared_sum(r)    # rdotr: Initial residual squared norm (\(r^T r\))
+        iteration = 0
 
         # stop init values gradient
         x = jax.lax.stop_gradient(x)
@@ -220,17 +223,21 @@ class TRPOLoss:
         rdotr_init = jax.lax.stop_gradient(rdotr_init)
         
         # iterative updates
-        val_init = (x, r, p, rdotr_init)
+        val_init = (x, r, p, rdotr_init, iteration)
 
         # run conjugate gradient iterations
-        val = jax.lax.fori_loop(0, cg_iters, lambda i, val: body_fn(val), val_init)
-        x, _, _, _ = val
+        val = val_init
+        for _ in range(cg_iters):
+            val = body_fn(val)
+            
+        # val = jax.lax.fori_loop(0, cg_iters, lambda i, val: body_fn(val), val_init)
+        new_x, new_r, _, _, _ = val
+        jax.debug.callback(lambda x: print_jax_info(x, "residual"), new_r)
 
         # Stop gradient to prevent backpropagation through the solver
-        x = jax.lax.stop_gradient(x)
-        jax.debug.callback(lambda x: print_jax_info(x, "cg gradient"), x)
+        new_x = jax.lax.stop_gradient(new_x)
 
-        return x
+        return new_x
     
     def backtracking_line_search(
         self, 
@@ -271,13 +278,15 @@ class TRPOLoss:
         idx = jnp.where(valid_mask.sum() > 0, idx, backtrack_iters)
         
         return alphas[idx]
-
+    
+    @check_nan_inf_decorator
     def update_step(
         self,
         params: dict,
         batch: Transition,
         advantages: jax.Array,
         targets: jax.Array,
+        learning_rate: float
     ) -> Tuple[dict, dict]:
         """Parameters update with TRPO"""
 
@@ -290,23 +299,25 @@ class TRPOLoss:
         
         # # 2. solve natural gradient direction F^{-1} * grad with conjugate gradient
         natural_grad = self.conjugate_gradient(params, batch, grads)
-        jax.debug.callback(lambda x: print_jax_info(x, "natural_grad"), natural_grad)
         
         # # 3. get step direction without constraint
         step_direction = natural_grad
+
+        jax.debug.callback(lambda x: print_jax_info(x, "natural_grad"), natural_grad)
         
         # # 4. get the maximal step length beta to make beta^2 * (step_dir^T F step_dir) <= delta
         # # 4.1 calculate: (step_dir^T F step_dir)
         fvp_step = self.fisher_vector_product(params, batch, step_direction)
-        shs = jax.tree_util.tree_reduce(
-            lambda s, x: s + jnp.sum(x), 
-            jax.tree_map(lambda s_leaf, f_leaf: s_leaf * f_leaf, step_direction, fvp_step), 
-            0.0
-        )
+        jax.debug.callback(lambda x: print_jax_info(x, "grads"), grads)
+        jax.debug.callback(lambda x: print_jax_info(x, "fvp_step"), fvp_step)
+        shs = tree_dot(step_direction, fvp_step)
+
+        jax.debug.callback(lambda x: print_jax_info(x, "shs"), shs)
         # # 4.2 calculate beta
-        beta = jnp.sqrt(self.config.delta / (shs + 1e-8))
+        beta = jnp.sqrt(self.config.delta / (shs+1e-8) )
         # beta = 1.0
         full_step = jax.tree_map(lambda s: beta * s, step_direction)
+        jax.debug.callback(lambda x: print_jax_info(x, "full_step"), full_step)
         
         # # 5. back linear search for optimal alpha (step size)
         alpha = self.backtracking_line_search(params, full_step, batch)
@@ -314,6 +325,7 @@ class TRPOLoss:
         
         # # 6. assemble final gradient
         final_gradient = jax.tree_map(lambda x: alpha * x, full_step)
+        final_gradient = jax.lax.stop_gradient(final_gradient)
         jax.debug.callback(lambda x: print_jax_info(x, "final_gradient"), final_gradient)
         
         return total_loss, final_gradient

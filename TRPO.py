@@ -24,6 +24,7 @@ from utils.config import AlgoConfig, ScheduleType, OptimizerType
 from utils.config import make_schedule_from_config as make_schedule
 from utils.config import make_tx_from_config as init_tx
 from utils.transition import Transition
+from utils.util_funcs import print_jax_info
 
 from value_calculator.gae_calculator import GAECalculator, GAEConfig
 from loss.trpo_loss import TRPOLoss, LossConfig
@@ -100,9 +101,12 @@ def update_minibatch(
         batch=traj_batch,
         advantages=advantages,
         targets=targets,
+        learning_rate=config.LR
     )
 
+    jax.debug.callback(lambda x: print_jax_info(x, "params: before"), train_state.params)
     train_state = train_state.apply_gradients(grads=grads)
+    jax.debug.callback(lambda x: print_jax_info(x, "params: after"), train_state.params)
 
     return train_state, total_loss
 
@@ -298,7 +302,7 @@ if __name__ == "__main__":
         NUM_STEPS=40, 
         TOTAL_TIMESTEPS=1e8, 
         UPDATE_EPOCHS=4, 
-        NUM_MINIBATCHES=128, 
+        NUM_MINIBATCHES=64, 
         GAMMA=0.99, 
         GAE_LAMBDA=0.95, 
         CLIP_EPS=1e5, 
@@ -321,6 +325,7 @@ if __name__ == "__main__":
 
     # jax.config.update("jax_debug_nans", True)
     # jax.config.update("jax_debug_infs", True)
+    # jax.config.update("jax_enable_x64", True)
 
     rng = jax.random.PRNGKey(20)
     train_jit = jax.jit(make_train(algo_config), device=jax.devices('gpu')[0])
