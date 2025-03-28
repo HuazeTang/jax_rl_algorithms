@@ -3,3 +3,4 @@
 install_jax_cu11.sh
 __pycache__
 *.out
+test_params.ipynb
