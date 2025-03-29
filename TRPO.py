@@ -5,6 +5,7 @@ from jax import config as jax_config
 import flax.linen as nn
 from flax.training.train_state import TrainState
 
+import optax
 import distrax
 import datetime
 import functools
@@ -96,16 +97,25 @@ def update_minibatch(
         )
     )
 
-    total_loss, grads  = trpo_loss.update_step(
+    total_loss, grads = trpo_loss.update_step(
         params=train_state.params,
         batch=traj_batch,
         advantages=advantages,
         targets=targets,
     )
+    actor_grads, critic_grads = grads
 
-    jax.debug.callback(lambda x: print_jax_info(x, "params: before"), train_state.params)
-    train_state = train_state.apply_gradients(grads=grads)
-    jax.debug.callback(lambda x: print_jax_info(x, "params: after"), train_state.params)
+    # jax.debug.callback(lambda x: print_jax_info(x, "params: before"), train_state.params)
+    train_state = train_state.apply_gradients(grads=critic_grads)
+    actor_updates = jax.tree_map(lambda x: x * -1., actor_grads)
+    new_params = {
+        'params': {
+            'actor': optax.apply_updates(train_state.params['params']['actor'], actor_updates['params']['actor']),
+            'critic': train_state.params['params']['critic']
+        }
+    }
+    train_state = train_state.replace(params=new_params)
+    # jax.debug.callback(lambda x: print_jax_info(x, "params: after"), train_state.params)
 
     return train_state, total_loss
 
@@ -230,6 +240,7 @@ def callback(
                 writer.add_scalar('episodic return', return_values[t], timesteps[t])
         else:
             writer.add_scalar('episodic return', return_values[0], timesteps[0])
+            print(f'episodic return: {return_values[0]}; timestep: {timesteps[0]}')
     writer.add_scalar('Loss/total_loss', loss_info[0].mean(), step_)
     writer.add_scalar('Loss/value_loss', loss_info[0][0].mean(), step_)
     writer.add_scalar('Loss/actor_loss', loss_info[0][1].mean(), step_)
@@ -255,7 +266,7 @@ def make_train(config: AlgoConfig) -> Callable:
         # Init writer
         timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         writer = SummaryWriter(logdir=f'./logs/TRPO_{config.ENV_NAME}_lr{config.LR}_steps{config.NUM_STEPS}_epochs{config.UPDATE_EPOCHS}_{timestamp}')  
-
+        jax.debug.print("Init writer done.")
         # Init network
         rng, _rng = jax.random.split(rng)
         network, network_params = init_network(
@@ -298,18 +309,18 @@ def make_train(config: AlgoConfig) -> Callable:
 if __name__ == "__main__":
     algo_config = AlgoConfig(
         NUM_ENVS=2048, 
-        NUM_STEPS=40, 
-        TOTAL_TIMESTEPS=1e8, 
+        NUM_STEPS=10, 
+        TOTAL_TIMESTEPS=1e9, 
         UPDATE_EPOCHS=4, 
-        NUM_MINIBATCHES=64, 
+        NUM_MINIBATCHES=32, 
         GAMMA=0.99, 
         GAE_LAMBDA=0.95, 
-        CLIP_EPS=1e5, 
+        CLIP_EPS=0.2, 
         ENT_COEF=0.0, 
         VF_COEF=0.5, 
         LR=3e-4, 
         MAX_GRAD_NORM=0.5, 
-        TX_TYPE=OptimizerType.NotUsing,
+        TX_TYPE=OptimizerType.Adam,
         ACTIVATION="tanh", 
         ANNEAL_LR=False, 
         SCHEDULE_TYPE=ScheduleType.Linear,
