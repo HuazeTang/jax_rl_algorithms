@@ -65,15 +65,11 @@ class ActorCritic(nn.Module):
     action_dim: Sequence[int]
     activation: str = "tanh"
 
-    def setup(self):
-        self.actor = Actor(action_dim=self.action_dim, activation=self.activation)
-        self.critic = Critic(activation=self.activation)
-
     # @mixed_precision()
     @nn.compact
     def __call__(self, x):
-        pi = self.actor(x)
-        critic = self.critic(x)
+        pi = Actor(action_dim=self.action_dim, activation=self.activation, name="actor")(x)
+        critic = Critic(activation=self.activation, name="critic")(x)
 
         return pi, critic
 
