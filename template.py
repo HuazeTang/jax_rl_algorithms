@@ -296,12 +296,25 @@ def make_train(config: AlgoConfig) -> Callable:
 
 if __name__ == "__main__":
     config = AlgoConfig(
-        NUM_ENVS=2048, NUM_STEPS=10, TOTAL_TIMESTEPS=1e8, UPDATE_EPOCHS=4, NUM_MINIBATCHES=32, 
-        GAMMA=0.99, GAE_LAMBDA=0.95, CLIP_EPS=0.2, ENT_COEF=0.0, VF_COEF=0.5, 
-        LR=3e-4, MAX_GRAD_NORM=0.5, TX_TYPE=OptimizerType.Adam,
+        NUM_ENVS=2048, 
+        NUM_STEPS=10, 
+        TOTAL_TIMESTEPS=1e8, 
+        UPDATE_EPOCHS=4, 
+        NUM_MINIBATCHES=32, 
+        GAMMA=0.99, 
+        GAE_LAMBDA=0.95, 
+        CLIP_EPS=0.2, 
+        ENT_COEF=0.0, 
+        VF_COEF=0.5, 
+        LR=3e-4, 
+        MAX_GRAD_NORM=0.5, 
+        TX_TYPE=OptimizerType.Adam,
         ACTIVATION="tanh", 
-        ANNEAL_LR=False, SCHEDULE_TYPE=ScheduleType.Linear,
-        ENV_NAME="walker2d", NORMALIZE_ENV=True, DEBUG=True, 
+        ANNEAL_LR=False,
+        SCHEDULE_TYPE=ScheduleType.Linear,
+        ENV_NAME="walker2d", 
+        NORMALIZE_ENV=True, 
+        DEBUG=True, 
     )
 
     value_calculator = GAECalculator(
